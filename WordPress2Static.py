@@ -55,6 +55,10 @@ CSS_IMPORT_RE = re.compile(r'''@import\s+(?P<quote>['"])(?P<url>[^'"]+)(?P=quote
 
 NON_FETCHABLE_PREFIXES = ('#', 'data:', 'mailto:', 'tel:', 'javascript:', 'about:')
 
+WP_CONTENT_URL_RE = re.compile(
+    r'''(?:https?:)?(?:\\?/){2}[A-Za-z0-9.-]+(?::\d+)?(?:\\?/[^\s"'`<>()\\/]*)*?\\?/wp-content\\?/[^\s"'`<>()]*''',
+    re.IGNORECASE)
+
 
 def sanitize_segment(segment):
     return re.sub(r'[<>:"\\|?*\x00-\x1f]', '_', segment)
@@ -72,7 +76,7 @@ def iter_srcset(value):
 
 
 class SiteExporter:
-    def __init__(self, base_url, output_folder_path, delay, strip_index_html=False):
+    def __init__(self, base_url, output_folder_path, delay, strip_index_html=False, aliases=()):
         split = urlsplit(base_url)
         if split.scheme not in ('http', 'https') or not split.hostname:
             raise ValueError(f'Invalid base URL: {base_url}')
@@ -81,6 +85,7 @@ class SiteExporter:
         self.netloc = split.netloc.lower()
         self.host = self.strip_www(split.hostname.lower())
         self.port = split.port
+        self.hosts = {self.host} | {self.strip_www(alias.lower()) for alias in aliases}
         self.base_path = split.path.rstrip('/') + '/'
         self.root_url = urlunsplit((self.scheme, self.netloc, self.base_path, '', ''))
 
@@ -110,7 +115,8 @@ class SiteExporter:
         split = urlsplit(url)
         if split.scheme not in ('http', 'https') or not split.hostname:
             return None
-        if self.strip_www(split.hostname.lower()) != self.host or split.port != self.port:
+        hostname = self.strip_www(split.hostname.lower())
+        if hostname not in self.hosts or (hostname == self.host and split.port != self.port):
             return None
 
         path = split.path or '/'
@@ -122,6 +128,9 @@ class SiteExporter:
     def site_relative_path(self, url):
         path = urlsplit(url).path
         return '/' + path[len(self.base_path):] if path.startswith(self.base_path) else '/'
+
+    def is_wp_content(self, url):
+        return self.site_relative_path(url).startswith('/wp-content/')
 
     def is_excluded(self, url):
         path = self.site_relative_path(url)
@@ -171,6 +180,9 @@ class SiteExporter:
         resolved = self.resolve(base_url, raw_url)
         normalized = self.normalize(resolved) if resolved else None
         target = self.local_paths.get(normalized)
+        if target is None and normalized and self.is_wp_content(normalized):
+            path = urlsplit(normalized).path
+            target = self.local_path_for(normalized, mimetypes.guess_type(path)[0] or '', path.lower().endswith(('.html', '.htm')))
         if target is None:
             return None
 
@@ -286,6 +298,21 @@ class SiteExporter:
                 self.discover_css_links(page_url, tag['style'])
             if tag.name == 'style' and tag.string:
                 self.discover_css_links(page_url, tag.string)
+            for attribute in self.free_text_attributes(tag):
+                self.discover_wp_content_links(page_url, tag[attribute])
+        for string in soup.find_all(string=True):
+            if 'wp-content' in string:
+                self.discover_wp_content_links(page_url, string)
+
+    @staticmethod
+    def free_text_attributes(tag):
+        handled = set(URL_ATTRIBUTES.get(tag.name, ())) | set(SRCSET_ATTRIBUTES)
+        return [attribute for attribute, value in tag.attrs.items()
+                if attribute not in handled and isinstance(value, str) and 'wp-content' in value]
+
+    def discover_wp_content_links(self, base_url, text):
+        for match in WP_CONTENT_URL_RE.finditer(text):
+            self.enqueue(self.resolve(base_url, match.group(0).replace('\\/', '/').rstrip('\\')))
 
     def discover_css_links(self, base_url, css_text):
         for regex in (CSS_URL_RE, CSS_IMPORT_RE):
@@ -303,6 +330,19 @@ class SiteExporter:
             return text[:start - whole_start] + new_url + text[end - whole_start:]
 
         return CSS_IMPORT_RE.sub(replace, CSS_URL_RE.sub(replace, css_text))
+
+    def rewrite_wp_content_links(self, text, base_url, local_path):
+        def replace(match):
+            raw = match.group(0)
+            trailing = raw[len(raw.rstrip('\\')):]
+            raw = raw[:len(raw) - len(trailing)]
+            escaped = '\\/' in raw
+            new_url = self.relative_link(local_path, base_url, raw.replace('\\/', '/'))
+            if new_url is None:
+                return match.group(0)
+            return (new_url.replace('/', '\\/') if escaped else new_url) + trailing
+
+        return WP_CONTENT_URL_RE.sub(replace, text)
 
     def rewrite_html(self, page_url, local_path, soup):
         for tag in soup.find_all(True):
@@ -322,6 +362,13 @@ class SiteExporter:
                 tag['style'] = self.rewrite_css(tag['style'], page_url, local_path)
             if tag.name == 'style' and tag.string:
                 tag.string = self.rewrite_css(tag.string, page_url, local_path)
+            for attribute in self.free_text_attributes(tag):
+                tag[attribute] = self.rewrite_wp_content_links(tag[attribute], page_url, local_path)
+        for string in soup.find_all(string=True):
+            if 'wp-content' in string:
+                new_text = self.rewrite_wp_content_links(string, page_url, local_path)
+                if new_text != string:
+                    string.replace_with(type(string)(new_text))
 
     def write_file(self, local_path, content):
         full_path = os.path.join(self.output_folder_path, *local_path.split('/'))
@@ -362,12 +409,15 @@ def main():
     parser.add_argument('--strip-index-html', action='store_true',
                         help='Link to directories ("about/") instead of "about/index.html". '
                              'Requires a web server; links will not work when opening files from disk.')
+    parser.add_argument('--alias', action='append', default=[], metavar='HOST',
+                        help='Another host name that serves the same site (e.g. an old development domain). '
+                             'Links to it are exported and made relative. Can be given more than once.')
 
     args = parser.parse_args()
     url = args.url
     output_folder_path = args.output_folder_path
 
-    SiteExporter(url, output_folder_path, args.delay, args.strip_index_html).export()
+    SiteExporter(url, output_folder_path, args.delay, args.strip_index_html, args.alias).export()
 
 
 if __name__ == "__main__":
